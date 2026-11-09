@@ -113,6 +113,19 @@ def aggregate(ctx: click.Context, **kwargs: Any) -> None:
     pl.aggregate(c)
 
 
+@cli.command(context_settings=CS, help=pl.cmf.__doc__)
+@click.pass_context
+@Config
+@Section
+@click.option("--full_scene", "--full-scene", "full_scene", is_flag=True, default=None,
+              help="One background over the whole image (for orthorectified scenes); same as --cmf.full_scene")
+def cmf(ctx: click.Context, full_scene: bool = None, **kwargs: Any) -> None:
+    if full_scene:
+        ctx.args += ["--cmf.full_scene", "True"]
+    c = init(ctx=ctx, **kwargs)
+    pl.cmf(c)
+
+
 @cli.command(context_settings=CS)
 @click.pass_context
 @Config

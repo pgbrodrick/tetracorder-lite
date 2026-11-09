@@ -10,7 +10,7 @@ The individual stages are also exposed as standalone ``tetrapy`` subcommands (se
 
 Stage order, as run by ``tetrapy run``:
 ``export_matrix`` -> ``convolve`` -> ``sensor`` -> ``setup`` -> ``tetrun`` ->
-``postprocess`` -> ``aggregate``. Each stage is gated by its own ``enabled`` flag in
+``postprocess`` -> ``aggregate`` -> ``cmf``. Each stage is gated by its own ``enabled`` flag in
 the config.
 """
 
@@ -63,6 +63,7 @@ def run(c: Box) -> None:
     5. tetrun - Execute tetracorder (cmd.runtet)
     6. postprocess - Convert matched outputs to COGs and/or prune paths
     7. aggregate - Aggregate outputs into L2B mineral/uncertainty products
+    8. cmf - Competitive matched filter over one group (independent of tetrun)
 
     After all stages complete, output directory permissions are set to
     ``ugo+rwX,o-w`` (group-writable, world-readable).
@@ -76,6 +77,7 @@ def run(c: Box) -> None:
         "tetrun",
         "postprocess",
         "aggregate",
+        "cmf",
     ]
     steps = [step for step in steps if c[step].enabled]
 
@@ -255,4 +257,45 @@ def aggregate(c: Box) -> None:
         out_minuncert = c.aggregate.out_minuncert,
         rfl           = c.data.rfl,
         rfluncert     = c.data.rfluncert,
+    )
+
+
+@utils.log_elapse
+def cmf(c: Box) -> None:
+    """
+    Competitive matched filter over one tetracorder group.
+
+    For each material in ``cmf.group``, runs a reflectance-mode matched filter
+    (diffmf style, per cross-track column, or over the whole image with
+    ``cmf.full_scene`` for orthorectified scenes) on only the channels its (non-exclusion)
+    features span, writing a thresholded, DEFLATE-compressed score stack, a per-pixel
+    rank order on window-normalized scores, and a material table. ``cmf.mode`` then
+    derives an identification product (e.g. ``single``: hunt for one mineral type in
+    the top ``top_n`` ranks). Needs the convolved libraries but not a tetracorder run.
+    """
+    from tetrapy import cmf
+
+    k = c.cmf
+    cmf.build(
+        rfl              = c.data.rfl,
+        expert           = k.expert,
+        group            = k.group,
+        reflib           = k.reflib,
+        reslib           = k.reslib,
+        output           = k.output,
+        mode             = k.get("mode", None),
+        # Default to the sensor's deleted channels so CMF and tetracorder see the same bands
+        deleted_channels = k.get("deleted_channels") or c.sensor.get("deleted_channels"),
+        feature_types    = k.get("feature_types") or cmf.ALL_FEATURES,
+        covariance_style = k.get("covariance_style") or "looshrinkage",
+        fixed_alpha      = k.get("fixed_alpha", None),
+        threshold        = k.get("threshold", 5.0),
+        threshold_type   = k.get("threshold_type") or "sigma",
+        rank_depth       = k.get("rank_depth", 10),
+        min_pixels       = k.get("min_pixels", 10),
+        rfl_nodata       = k.get("rfl_nodata", -9999),
+        full_scene       = bool(k.get("full_scene")),
+        alpha_pixels     = k.get("alpha_pixels", 50000),
+        cores            = k.get("cores") or 1,
+        reuse            = bool(k.get("reuse")),
     )

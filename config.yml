@@ -103,3 +103,33 @@ aggregate:
   out_min: ${output.tetrapy}/agg.nc # Supports .nc or .tif
   out_minuncert: ${output.tetrapy}/agg-uncert.nc # Supports .nc or .tif
   reference: tetrapy/data/v6.00a6.csv
+cmf:
+  enabled: False                # Independent of tetrun; needs only the convolved libraries
+  expert: ${tetracorder.root}/tetracorder.cmds/tetracorder${tetracorder.version}.cmds
+  group: 2
+  reflib: ${convolve.output.reflib}
+  reslib: ${convolve.output.reslib}
+  # deleted_channels: defaults to sensor.deleted_channels
+  feature_types: [DLw, MLw, OLw, WLw, DCw, MCw, OCw, WCw] # All f-features (linear + curved); NOT
+                                # (exclusion) features are never used
+  covariance_style: looshrinkage # looshrinkage | empirical (as diffmf)
+  fixed_alpha: null             # null == fit by LOO-CV per column
+  threshold: 5                  # Scores below this are written as 0 and not ranked
+  threshold_type: sigma         # sigma == threshold in background std devs (mf*sqrt(s'C^-1 s)); raw == on MF itself
+  rank_depth: 10                # Rank bands kept (must be >= mode.top_n)
+  min_pixels: 10
+  full_scene: False             # True == one background for the whole image (orthorectified scenes)
+  rfl_nodata: -9999             # Reflectance nodata, excluded from the background (null to disable)
+  alpha_pixels: 50000           # full_scene: pixels subsampled to fit the shrinkage alpha
+  cores: 8
+  reuse: False                  # True == reuse existing scores/rank and rerun only the mode
+  output:
+    scores: ${output.tetrapy}/cmf/group${cmf.group}_scores.tif
+    rank: ${output.tetrapy}/cmf/group${cmf.group}_rank.tif
+    minerals: ${output.tetrapy}/cmf/group${cmf.group}_minerals.csv
+    norm: ${output.tetrapy}/cmf/group${cmf.group}_norm.npy
+  mode:
+    name: single
+    target: "kaol*"             # tetracorder id or glob (or a list of them)
+    top_n: 3
+    output: ${output.tetrapy}/cmf/group${cmf.group}_single.tif

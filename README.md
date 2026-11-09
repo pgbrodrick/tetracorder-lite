@@ -273,6 +273,8 @@ flag in the config, so you can run any subset:
 | Tetrun | `tetrun` | Execute the configured run (`cmd.runtet`), logging to `{output.tetracorder}/tetrun.log` |
 | Postprocess | `postprocess` | Convert matched tetracorder outputs into COGs and/or delete matched paths |
 | Aggregate | `aggregate` | Aggregate tetracorder outputs into L2B mineral/uncertainty products |
+| `cmf` | Competitive matched filter over one group, plus an identification mode (e.g. `single`). Add `--full_scene` for orthorectified scenes |
+| CMF | `cmf` | Competitive matched filter over one group's materials (off by default; see `tetrapy/cmf.py`) |
 
 Setup removes `output.tetracorder` first if it already exists, since
 `cmd-setup-tetrun` requires it to be absent. When `log.config` is set, the resolved
@@ -508,6 +510,7 @@ as `run`:
 | `tetrun` | Execute a previously-configured run (`cmd.runtet`) |
 | `postprocess` | Convert matched tetracorder outputs into COGs and/or delete matched paths |
 | `aggregate` | Aggregate tetracorder outputs into L2B mineral/uncertainty products |
+| `cmf` | Competitive matched filter over one group, plus an identification mode (e.g. `single`). Add `--full_scene` for orthorectified scenes |
 | `preview` | Print the final, interpolated config without running anything |
 
 Every command takes the same `config` argument, `-s/--section` option, and dotted
@@ -644,6 +647,7 @@ tetracorder-lite/
     sensor.py            #   tetracorder command-tree integration, deleted channels
     postprocess.py       #   COG conversion (optionally orthorectified) + output pruning
     aggregate.py         #   L2B mineral/uncertainty product aggregation
+    cmf.py               #   competitive matched filter over a tetracorder group
     tetracorder.py       #   expert-system command-file decoder
     utils.py             #   shared helpers
     conv/                #   specpr I/O + Gaussian convolution internals

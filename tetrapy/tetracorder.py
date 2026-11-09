@@ -38,6 +38,12 @@ import pandas as pd
 
 Logger = logging.getLogger(__name__)
 
+# Feature importance letter (D=diagnostic, M=must, O=optional, W=weak) + continuum
+# shape (L=linear, C=curved) + ``w`` (wavelength units). See tetracorder getifeat.r.
+LINEAR_FEATURE_TYPES = ("DLw", "MLw", "OLw", "WLw")
+CURVED_FEATURE_TYPES = ("DCw", "MCw", "OCw", "WCw")
+FEATURE_TYPES = LINEAR_FEATURE_TYPES + CURVED_FEATURE_TYPES
+
 
 class TetraDecoder:
     """
@@ -114,10 +120,19 @@ class TetraDecoder:
         if files := list(self.root.glob(f"cmds.start.*")):
             self.groups = self.parse_group_paths(files[0])
 
-        # Unused
-        # self.nots = {}
-        # if (f := self.root / "cmd.lib.setup.nots-ratios").exists():
-        #     self.nots = self.parse_not_ratios(f)
+        # NOT-feature reference spectra: ``[NAME]`` -> (library, record). Tetracorder's
+        # setup copies one of cmd.lib.setup.nots-ratios-{small,medium,large} into the run
+        # directory as cmd.lib.setup.nots-ratios; in the source tree use -small, the
+        # default for <= 2171-channel spectrometers.
+        self.nots = {}
+        for name in ("cmd.lib.setup.nots-ratios", "cmd.lib.setup.nots-ratios-small"):
+            if (f := self.root / name).exists():
+                self.nots = {
+                    key: (lib, int(rec))
+                    for lib, entries in self.parse_not_ratios(f).items()
+                    for key, rec in entries.items()
+                }
+                break
 
         self.only = groups
         if not groups:
@@ -191,6 +206,9 @@ class TetraDecoder:
                 Spectral library ID the reference record lives in (e.g. ``splib06``).
             ``record`` : int
                 Record number of the reference spectrum within ``library``.
+            ``materials`` : list[str]
+                Spectrally active components from ``list materials`` (e.g.
+                ``neodymium``, ``kaolinite``).
             ``filename`` : str
                 Output base file name written by the mapper.
             ``path`` : str
@@ -199,10 +217,14 @@ class TetraDecoder:
             ``data_type_scaling`` : float
                 Scaling applied to the 8-bit (``0-255``) output DN.
             ``features`` : list[dict]
-                Spectral features. Each feature has ``feature_type`` (``DLw``/``MLw``/
-                ``OLw``), a 4-element ``continuum`` (left/right window endpoints), and
+                Spectral features. Each feature has ``feature_type`` (linear
+                ``DLw``/``MLw``/``OLw``/``WLw`` or curved ``DCw``/``MCw``/``OCw``/``WCw``),
+                a ``continuum`` of window endpoints (4 values for linear, 8 for
+                curved continua), and
                 one list per fit/depth constraint keyword found on the feature line
                 (e.g. ``ct``, ``rcbblc<``).
+            ``not_features`` : list[dict]
+                Exclusion features (``n... NOT`` lines); see :meth:`parse_not`.
             ``constituent_constraints`` : dict[str, list[float]]
                 Per-block constraint keyword -> values (e.g. ``FD-FIT>``, ``FITALL>``).
         """
@@ -227,6 +249,14 @@ class TetraDecoder:
                 data["library"] = split[2].strip("[]")
                 data["record"] = int(split[3])
 
+            elif line.startswith("list materials"):
+                # Spectrally active components, one per line (first token is the name)
+                data["materials"] = []
+                for mat in block[i + 1:]:
+                    if mat.startswith("end_list_materials"):
+                        break
+                    data["materials"].append(mat.split()[0])
+
             elif line.startswith("define output"):
                 data["filename"] = block[i+2]
                 data["path"] = None
@@ -240,22 +270,28 @@ class TetraDecoder:
 
             elif line.startswith("define features"):
                 data["features"] = []
+                by_label = {}
                 while (line := block[i]) != "endfeatures":
                     i += 1
-                    # Substitute variables, if necessary
-                    split = [self.vars.get(v.strip("[]"), v) for v in line.split()]
-                    if line.startswith("f") and split[1] in ("DLw", "MLw", "OLw"):
+                    # Substitute variables, if necessary. A variable may hold several
+                    # numbers (e.g. [RBD22] = "0.0007 0.0011"), so re-split afterwards.
+                    split = " ".join(self.vars.get(v.strip("[]"), v) for v in line.split()).split()
+                    if line.startswith("n") and len(split) > 1 and split[1] == "NOT":
+                        data.setdefault("not_features", []).append(self.parse_not(line))
+                    elif line.startswith("f") and len(split) > 1 and split[1] in FEATURE_TYPES:
+                        # Linear continua (xLw) give 4 endpoints; curved (xCw) give 8
+                        n = 4 if split[1] in LINEAR_FEATURE_TYPES else 8
                         feat = {
                             "feature_type": split[1],
-                            "continuum": self.cast(float, split[2:6]),
+                            "continuum": self.cast(float, split[2:2 + n]),
                         }
-
-                        line = " ".join(split[6:])
-                        matches = re.findall(r"([^\s\d]+)>?\s+(.+?)(?=\s+[^\s\d]+>?[\s]|$)", line)
-                        for key, val in matches:
-                            feat[key] = self.cast(float, val.split())
-
+                        feat.update(self.parse_feature_constraints(split[2 + n:]))
+                        by_label[split[0]] = feat
                         data["features"].append(feat)
+                    elif line.startswith("f") and len(split) > 1 and split[0] in by_label:
+                        # Continuation line ("f1a   r*bd> ..."): more constraints for the
+                        # feature already declared under the same label.
+                        by_label[split[0]].update(self.parse_feature_constraints(split[1:]))
 
             elif line.startswith("constraint:"):
                 consts = data.setdefault("constituent_constraints", {})
@@ -266,6 +302,80 @@ class TetraDecoder:
                     consts[key] = self.cast(float, val.split())
 
         return data
+
+    @staticmethod
+    def parse_feature_constraints(tokens: List[str]) -> Dict[str, List[float]]:
+        """
+        Parse per-feature constraint tokens into ``{key: [values]}``.
+
+        Keys are the non-numeric tokens (``ct``, ``r*bd>``, ``lct/rct>``, ``rcbblc<``,
+        ...); the numbers that follow a key are its values. ``weight*2.2`` is a single
+        token and becomes ``{"weight": [2.2]}``. Variables must already be substituted.
+        """
+        out: Dict[str, List[float]] = {}
+        key = None
+        for tok in tokens:
+            if tok.startswith("weight*"):
+                try:
+                    out["weight"] = [float(tok.split("*", 1)[1])]
+                except ValueError:
+                    out["weight"] = [tok.split("*", 1)[1]]
+                key = None
+                continue
+            try:
+                val = float(tok)
+            except ValueError:
+                key = tok
+                out.setdefault(key, [])
+                continue
+            if key is not None:
+                out[key].append(val)
+        return out
+
+    def parse_not(self, line: str) -> dict:
+        """
+        Parse an exclusion (``NOT``) feature line.
+
+        Format (tetracorder ``getnotfeat``)::
+
+            n1a NOT [NOTGREENVEG]  1  0.50a 0.5
+            n1a NOT [NOTGREENVEG]  2  0.10r1 0.5
+
+        i.e. reference material (a ``[NAME]`` from ``cmd.lib.setup.nots-ratios`` or an
+        explicit ``library record`` pair), the feature number *of that material*, a
+        depth threshold flagged ``a`` (absolute) or ``rN`` (relative to this material's
+        feature ``N``), and a fit threshold. Tetracorder zeroes this material's
+        fit/depth wherever the referenced feature is found with depth and fit above
+        both thresholds.
+
+        Returns
+        -------
+        dict
+            ``ref`` (the name or ``"lib rec"``), ``library``, ``record``, ``feature``
+            (1-based, of the referenced material), ``depth``, ``relative_to`` (``None``
+            for absolute, else this material's 1-based feature number), ``fit``.
+        """
+        tokens = line.split("\\#")[0].split()[2:]
+        ref = tokens[0]
+        if ref.startswith("["):
+            name = ref.strip("[]")
+            lib, rec = self.nots.get(name, (None, None))
+            rest = tokens[1:]
+        else:                                  # explicit "<lib-letter> <record>"
+            name, lib, rec = f"{tokens[0]} {tokens[1]}", tokens[0], self.cast(int, tokens[1])
+            rest = tokens[2:]
+        m = re.match(r"^([0-9.]+)([ar])(\d*)$", rest[1])
+        if not m:
+            raise ValueError(f"Unparseable NOT depth threshold {rest[1]!r} in {line!r}")
+        return {
+            "ref": name,
+            "library": lib,
+            "record": rec,
+            "feature": int(rest[0]),
+            "depth": float(m.group(1)),
+            "relative_to": int(m.group(3)) if m.group(2) == "r" else None,
+            "fit": float(rest[2]),
+        }
 
     def get_groups(self, groups: Iterable[int]) -> List[dict]:
         """
