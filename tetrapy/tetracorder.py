@@ -85,6 +85,7 @@ class TetraDecoder:
         groups: Tuple[int, ...] = (1, 2),
         decode: bool = True,
         raise_casts: bool = True,
+        variables: Optional[Union[str, Path]] = None,
     ):
         """
         Parameters
@@ -104,6 +105,12 @@ class TetraDecoder:
         raise_casts : bool, default=True
             Whether to raise exceptions when type casting fails in :meth:`cast`. If
             False, failed casts return the original value instead of raising an error.
+        variables : str or Path, optional
+            ``cmd.lib.setup.variables`` file defining the ``[NAME]`` thresholds. By
+            default the run-directory copy next to the expert system is used, falling back
+            to ``VARIABLES/cmd.lib.setup.variables-default`` in the command tree (what
+            ``cmd-setup-tetrun`` copies when no dataset-specific file exists). Unresolved
+            ``[NAME]`` references are reported in :attr:`unresolved`.
         """
         self.file = Path(path)
         if self.file.is_dir():
@@ -113,8 +120,18 @@ class TetraDecoder:
         self.root = self.file.parent
 
         self.vars = {}
-        if (f := self.root / "cmd.lib.setup.variables").exists():
-            self.vars = self.parse_variables(f)
+        self.variables_file = None
+        candidates = [Path(variables)] if variables else [
+            self.root / "cmd.lib.setup.variables",
+            self.root / "VARIABLES" / "cmd.lib.setup.variables-default",
+        ]
+        for f in candidates:
+            if f.exists():
+                self.vars = self.parse_variables(f)
+                self.variables_file = f
+                break
+        if variables and self.variables_file is None:
+            raise FileNotFoundError(f"Variables file not found: {variables}")
 
         self.groups = {}
         if files := list(self.root.glob(f"cmds.start.*")):
@@ -172,6 +189,22 @@ class TetraDecoder:
                 self.blocks.append(block)
             else:
                 self.ignored.append(block)
+
+        # Any "[NAME]" left as a string means its variable was not defined
+        self.unresolved = sorted({
+            tok
+            for b in self.blocks + self.ignored
+            for d in [*(b.get("features") or []), b.get("constituent_constraints") or {}]
+            for k, v in d.items()
+            for tok in ([k] + (v if isinstance(v, list) else []))
+            if isinstance(tok, str) and tok.startswith("[") and tok.endswith("]")
+        })
+        if self.unresolved:
+            Logger.warning(
+                f"{len(self.unresolved)} expert-system variables unresolved "
+                f"(variables file: {self.variables_file}): {', '.join(self.unresolved[:8])}"
+                + (" ..." if len(self.unresolved) > 8 else "")
+            )
 
         return self.blocks
 

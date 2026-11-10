@@ -42,6 +42,17 @@ RES_RECNO = 12           # output resolution grid
 CHAN_RECNO = 18          # channel-number reference spectrum
 FIRST_SPECTRUM = 30      # first convolved spectrum
 PADS_PER_SPECTRUM = 4    # trailing padding records after each spectrum
+SPECTRUM_SLOT = 6        # records per spectrum block (head + continuation + 4 pads)
+# A spectrum needs 1 head record + ceil((n - 256) / 383) continuations; the fixed layout
+# (and the expert system's absolute record numbers) assume it fits in one slot.
+MAX_CHANNELS = 256 + 383 * (SPECTRUM_SLOT - 1)   # 2171 = specpr's "SMALL" library limit
+
+
+def _pad_to(writer: "SpecprWriter", recno: int) -> None:
+    """Pad with blank records up to (not including) ``recno``; fail if already past it."""
+    if writer.next_recno > recno:
+        raise ValueError(f"spectrum overflowed its record slot ({writer.next_recno} > {recno})")
+    writer.append_pads(recno - writer.next_recno)
 
 # Family tag written into each convolved title, keyed by master library filename.
 FAMILIES = {"splib06b": "s06tetra", "sprlb06b": "r06tetra"}
@@ -270,17 +281,17 @@ def _write_grid_records(writer: SpecprWriter, grid: TargetGrid) -> None:
     """
     nb = grid.nbands
 
-    def emit(recno: int, title: str, values: np.ndarray, pads: int) -> None:
+    def emit(recno: int, title: str, values: np.ndarray, next_slot: int) -> None:
         assert writer.next_recno == recno, (writer.next_recno, recno)
         writer.append_spectrum(
             values=values.astype(np.float32), title=_title(title), itchan=nb,
             irwav=WAVE_RECNO, irespt=RES_RECNO, usernm=USERNM)
-        writer.append_pads(pads)
+        _pad_to(writer, next_slot)      # fixed slots, whatever the channel count
 
-    emit(WAVE_RECNO, f"Wavelengths in microns {nb} ch", grid.wavelengths, 4)
-    emit(RES_RECNO, f"Resolution  in microns {nb} ch", grid.fwhm, 4)
+    emit(WAVE_RECNO, f"Wavelengths in microns {nb} ch", grid.wavelengths, RES_RECNO)
+    emit(RES_RECNO, f"Resolution  in microns {nb} ch", grid.fwhm, CHAN_RECNO)
     emit(CHAN_RECNO, f"Data value = channel number ({nb} ch)",
-         np.arange(1, nb + 1, dtype=np.float32), 10)
+         np.arange(1, nb + 1, dtype=np.float32), FIRST_SPECTRUM)
     assert writer.next_recno == FIRST_SPECTRUM, writer.next_recno
 
 
@@ -302,6 +313,8 @@ def build_library(
         Scene reflectance data path; its ``.hdr`` supplies the target grid.
     """
     grid = read_grid(rfl)
+    if grid.nbands > MAX_CHANNELS:
+        raise ValueError(f"{grid.nbands} channels exceeds the {MAX_CHANNELS}-channel SMALL library layout")
     master = SpecprFile.open(master_path)
     index = index_master(master)
     convolver = Convolver(grid.wavelengths, grid.fwhm)
@@ -318,6 +331,7 @@ def build_library(
     nb = grid.nbands
     placeholders = 0
     for recno in index.spectra:
+        slot = writer.next_recno            # this spectrum's fixed 6-record block
         head = master.record(recno)
         title = _title(_convolved_title(head.title, family))
         wave_rec = index.wave_by_channels.get(head.itchan)
@@ -339,7 +353,9 @@ def build_library(
             writer.append_spectrum(
                 values=convolved, title=title, itchan=nb, icflag=head.icflag,
                 irwav=WAVE_RECNO, irespt=RES_RECNO, usernm=USERNM, template=head)
-        writer.append_pads(PADS_PER_SPECTRUM)
+        # Pad to a fixed 6-record slot so record numbers match the expert system for any
+        # channel count (a <=256-channel spectrum has no continuation record).
+        _pad_to(writer, slot + SPECTRUM_SLOT)
 
     writer.write(out_path)
     Logger.debug(f"[{family}] wrote {out_path}: {writer.next_recno} records "
