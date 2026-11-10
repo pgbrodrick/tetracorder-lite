@@ -26,9 +26,14 @@ Detections must pass all three thresholds:
 - ``rfl_max >= --min-rfl`` (default 0.05, brightest fit channel): depth is relative to the
   continuum, so very dark pixels (shadow, water) reach large "depths" from noise alone.
 
-Outputs (in --out): ``<name>_depth`` and ``<name>_r2`` ENVI float32 rasters (all pixels, unthresholded),
-``<name>_hits.csv`` (detections only: line, sample, depth, r2, rfl_max, easting, northing) and
-``<name>.json`` (counts after each threshold).
+Outputs (in --out):
+
+- ``<name>_depth``, ``<name>_r2``: ENVI float32 rasters for every valid pixel, NOT thresholded
+  (for re-thresholding without rerunning).
+- ``<name>_depth_filtered``: depth where a pixel passes all three thresholds, NaN elsewhere;
+  matches the hits table.
+- ``<name>_hits.csv``: detections only (line, sample, depth, r2, rfl_max, easting, northing).
+- ``<name>.json``: thresholds used and counts after each one.
 
 Inputs: an ENVI cube (wavelength + fwhm in header) or a netCDF4 reflectance file with
 ``reflectance (bands, y, x)``, ``wavelength`` and ``fwhm`` variables (EMIT/AVIRIS-5 L2A ORT layout).
@@ -138,8 +143,7 @@ def write_envi(path, arr, name, cube):
         mi = cube.map_info; h.append(f"map info = {{{', '.join(mi) if isinstance(mi, list) else mi}}}")
     elif cube.easting is not None and cube.northing is not None:
         de = cube.easting[1] - cube.easting[0]; dn = cube.northing[0] - cube.northing[1]
-        h.append(f"map info = {{UTM, 1, 1, {cube.easting[0] - de / 2}, {cube.northing[0] + dn / 2}, {de}, {dn}, 11, North, WGS-84}}"
-                 "  ; zone assumed 11N, check")
+        h.append(f"map info = {{UTM, 1, 1, {cube.easting[0] - de / 2}, {cube.northing[0] + dn / 2}, {de}, {dn}, 11, North, WGS-84}}")  # UTM zone 11N assumed
     Path(str(path) + ".hdr").write_text("\n".join(h) + "\n")
 
 
@@ -259,6 +263,8 @@ def run(args):
     write_envi(out / f"{name}_r2", R2, f"{args.target} fit r2", cube)
     pass_d = D >= args.min_depth; pass_r = R2 >= args.min_r2; pass_b = BR >= args.min_rfl
     det = pass_d & pass_r & pass_b
+    write_envi(out / f"{name}_depth_filtered", np.where(det, D, np.nan),
+               f"{args.target} fit depth (depth>={args.min_depth} r2>={args.min_r2} rfl>={args.min_rfl})", cube)
     ys, xs = np.nonzero(det)
     o = np.argsort(-D[ys, xs]); ys, xs = ys[o], xs[o]
     with open(out / f"{name}_hits.csv", "w") as f:
