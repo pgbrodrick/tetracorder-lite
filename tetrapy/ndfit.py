@@ -26,12 +26,15 @@ Detections must pass all three thresholds:
 - ``rfl_max >= --min-rfl`` (default 0.05, brightest fit channel): depth is relative to the
   continuum, so very dark pixels (shadow, water) reach large "depths" from noise alone.
 
-Outputs (in --out):
+Outputs (in --out), all ENVI float32 with ``data ignore value = --nodata`` (default -9999):
 
-- ``<name>_depth``, ``<name>_r2``: ENVI float32 rasters for every valid pixel, NOT thresholded
-  (for re-thresholding without rerunning).
-- ``<name>_depth_filtered``: depth where a pixel passes all three thresholds, NaN elsewhere;
+- ``<name>_depth``, ``<name>_r2``: every pixel, NOT thresholded (for re-thresholding without rerunning).
+- ``<name>_depth_filtered``: depth where a pixel passes all three thresholds, 0 where it does not;
   matches the hits table.
+
+Nodata: a pixel whose input reflectance is the fill value (--nodata, default -9999, or non-finite) in
+any fit channel is written as the fill value in every raster. Valid pixels that cannot be fitted
+(non-positive reflectance in a fit channel) are written as 0.
 - ``<name>_hits.csv``: detections only (line, sample, depth, r2, rfl_max, easting, northing).
 - ``<name>.json``: thresholds used and counts after each one.
 
@@ -87,8 +90,8 @@ def parse_ranges(s):
 class NCCube:
     """netCDF4 L2A reflectance: reflectance(bands, y, x), wavelength, fwhm (nm)."""
 
-    def __init__(self, path):
-        self.path = Path(path)
+    def __init__(self, path, nodata=-9999.0):
+        self.path = Path(path); self.nodata = nodata
         try:
             import netCDF4
             ds = netCDF4.Dataset(path); ds.set_auto_mask(False)
@@ -108,37 +111,41 @@ class NCCube:
         self.map_info = None
 
     def block(self, y0, y1, chans):
-        """(lines, samples, len(chans)) float32 for a contiguous channel range covering chans."""
+        """Reflectance (lines, samples, len(chans)) float32 and the nodata mask (lines, samples):
+        True where any fit channel is the fill value or non-finite."""
         c0, c1 = int(chans.min()), int(chans.max()) + 1
-        x = np.asarray(self._r[c0:c1, y0:y1, :], dtype=np.float32)
-        return x[chans - c0].transpose(1, 2, 0)
+        x = np.asarray(self._r[c0:c1, y0:y1, :], dtype=np.float32)[chans - c0].transpose(1, 2, 0)
+        nd = ~np.isfinite(x).all(-1) | np.isclose(x, self.nodata).any(-1)
+        return x, nd
 
 
 class ENVICube:
-    def __init__(self, path):
+    def __init__(self, path, nodata=-9999.0):
         from tetrapy.mixmap import Cube
-        self.c = Cube(Path(path)); self.path = Path(path)
+        self.c = Cube(Path(path), nodata=nodata); self.path = Path(path)
         self.wl, self.fwhm = self.c.wl, self.c.fwhm
         self.bands, self.lines, self.samples = self.c.bands, self.c.lines, self.c.samples
         self.easting = self.northing = None
         self.map_info = self.c.hdr.get("map info")
 
     def block(self, y0, y1, chans):
-        refl, bad = self.c.block(y0, y1)
-        x = refl[..., chans]; x[bad] = np.nan
-        return x
+        refl, bad = self.c.block(y0, y1, self._valid(chans))     # bad: fill / non-finite / < -0.05
+        return refl[..., chans], bad
+
+    def _valid(self, chans):
+        v = np.zeros(self.bands, bool); v[chans] = True; return v
 
 
-def open_cube(path):
+def open_cube(path, nodata=-9999.0):
     p = Path(path)
-    return NCCube(p) if p.suffix.lower() in (".nc", ".nc4", ".h5") else ENVICube(p)
+    return NCCube(p, nodata) if p.suffix.lower() in (".nc", ".nc4", ".h5") else ENVICube(p, nodata)
 
 
-def write_envi(path, arr, name, cube):
+def write_envi(path, arr, name, cube, nodata=-9999.0):
     arr = np.ascontiguousarray(arr[None].astype(np.float32)); arr.tofile(path)
     h = ["ENVI", f"samples = {arr.shape[2]}", f"lines = {arr.shape[1]}", "bands = 1", "header offset = 0",
          "file type = ENVI Standard", "data type = 4", "interleave = bsq", "byte order = 0",
-         f"band names = {{{name}}}", "data ignore value = nan"]
+         f"band names = {{{name}}}", f"data ignore value = {nodata:g}"]
     if cube.map_info:
         mi = cube.map_info; h.append(f"map info = {{{', '.join(mi) if isinstance(mi, list) else mi}}}")
     elif cube.easting is not None and cube.northing is not None:
@@ -233,7 +240,7 @@ def fit(CR, tvec, w, keep, deg=2):
 
 def run(args):
     t0 = time.time()
-    cube = open_cube(args.cube)
+    cube = open_cube(args.cube, args.nodata); ND_VAL = np.float32(args.nodata)
     wl = cube.wl
     usable = np.ones(wl.size, bool)
     for a, b in parse_ranges(args.deleted_um): usable &= ~((wl >= a) & (wl <= b))
@@ -246,25 +253,34 @@ def run(args):
     Logger.info(f"{cube.path.name}: {cube.lines}x{cube.samples}, {chans.size} fit channels "
                 f"{w[0]:.3f}-{w[-1]:.3f} um, target {args.target} (max CR depth {tvec.max():.3f})")
     y0s = range(0, cube.lines, args.block_lines)
-    D = np.full((cube.lines, cube.samples), np.nan, np.float32); R2 = np.full_like(D, np.nan); BR = np.full_like(D, np.nan)
+    # 0 = valid but not fitted / no signal; nodata pixels are set to the fill value after the loop
+    D = np.zeros((cube.lines, cube.samples), np.float32); R2 = np.zeros_like(D); BR = np.zeros_like(D)
+    NODATA = np.zeros(D.shape, bool); FIT = np.zeros(D.shape, bool)
     for y0 in y0s:
         y1 = min(y0 + args.block_lines, cube.lines)
-        X = cube.block(y0, y1, chans)
-        good = np.isfinite(X).all(-1) & (X > 0).all(-1)
+        X, nd = cube.block(y0, y1, chans)
+        NODATA[y0:y1] = nd
+        good = ~nd & (X > 0).all(-1)
+        FIT[y0:y1] = good
         if good.any():
             Xg = X[good]
             CR = np.concatenate([hull_cr_fast(w, Xg[i:i + 8192]) for i in range(0, len(Xg), 8192)])
             d, r2 = fit(CR, tvec, w, keep, args.baseline_deg)
-            D[y0:y1][good] = d; R2[y0:y1][good] = r2; BR[y0:y1][good] = Xg.max(-1)
+            ok = np.isfinite(d) & np.isfinite(r2)                    # guard: unfittable -> 0, not NaN
+            D[y0:y1][good] = np.where(ok, d, 0); R2[y0:y1][good] = np.where(ok, r2, 0); BR[y0:y1][good] = Xg.max(-1)
+            FIT[y0:y1][good] = ok
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     stem = Path(args.cube).name.split("_L2A")[0] if "_L2A" in Path(args.cube).name else Path(args.cube).stem
     name = f"{stem}_{args.target}"
-    write_envi(out / f"{name}_depth", D, f"{args.target} fit depth", cube)
-    write_envi(out / f"{name}_r2", R2, f"{args.target} fit r2", cube)
-    pass_d = D >= args.min_depth; pass_r = R2 >= args.min_r2; pass_b = BR >= args.min_rfl
+    pass_d = FIT & (D >= args.min_depth); pass_r = FIT & (R2 >= args.min_r2); pass_b = FIT & (BR >= args.min_rfl)
     det = pass_d & pass_r & pass_b
-    write_envi(out / f"{name}_depth_filtered", np.where(det, D, np.nan),
-               f"{args.target} fit depth (depth>={args.min_depth} r2>={args.min_r2} rfl>={args.min_rfl})", cube)
+    filt = np.where(det, D, np.float32(0))
+    for arr in (D, R2, filt): arr[NODATA] = ND_VAL
+    write_envi(out / f"{name}_depth", D, f"{args.target} fit depth", cube, args.nodata)
+    write_envi(out / f"{name}_r2", R2, f"{args.target} fit r2", cube, args.nodata)
+    write_envi(out / f"{name}_depth_filtered", filt,
+               f"{args.target} fit depth (depth>={args.min_depth} r2>={args.min_r2} rfl>={args.min_rfl}; 0 = below threshold)",
+               cube, args.nodata)
     ys, xs = np.nonzero(det)
     o = np.argsort(-D[ys, xs]); ys, xs = ys[o], xs[o]
     with open(out / f"{name}_hits.csv", "w") as f:
@@ -273,11 +289,12 @@ def run(args):
             e = cube.easting[x] if cube.easting is not None else np.nan
             n = cube.northing[y] if cube.northing is not None else np.nan
             f.write(f"{y},{x},{D[y, x]:.5f},{R2[y, x]:.4f},{BR[y, x]:.4f},{e:.2f},{n:.2f}\n")
-    v = np.isfinite(D)
+    df = D[FIT]
     summ = dict(cube=str(args.cube), target=args.target, baseline_deg=args.baseline_deg, window_um=[args.lo, args.hi], mask_um=args.mask_um,
-                fit_channels=int(chans.size), valid_pixels=int(v.sum()),
+                fit_channels=int(chans.size), nodata_value=args.nodata, nodata_pixels=int(NODATA.sum()),
+                valid_pixels=int((~NODATA).sum()), fitted_pixels=int(FIT.sum()),
                 depth_pct=dict(zip(["p50", "p99", "p99.9", "p99.99", "max"],
-                                   [float(x) for x in np.r_[np.nanpercentile(D, [50, 99, 99.9, 99.99]), np.nanmax(D)]])),
+                                   [float(x) for x in (np.r_[np.percentile(df, [50, 99, 99.9, 99.99]), df.max()] if df.size else [np.nan] * 5)])),
                 thresholds=dict(min_depth=args.min_depth, min_r2=args.min_r2, min_rfl=args.min_rfl),
                 n_pass_depth=int(pass_d.sum()), n_pass_depth_rfl=int((pass_d & pass_b).sum()),
                 n_pass_depth_r2=int((pass_d & pass_r).sum()), n_detections=int(len(ys)),
@@ -298,6 +315,7 @@ def main(argv=None):
     ap.add_argument("--deleted-um", default="0.38-0.405 0.93-0.963 1.11-1.164 1.327-1.477 1.770-1.968 2.455-2.50")
     ap.add_argument("--mask-um", default=DEFAULT_MASK, help="ranges kept for the hull but dropped from the fit")
     ap.add_argument("--baseline-deg", type=int, default=2, help="polynomial baseline fitted with the library (-1 = none)")
+    ap.add_argument("--nodata", type=float, default=-9999.0, help="input fill value; also written to nodata output pixels")
     ap.add_argument("--min-depth", type=float, default=0.035, help="detection: fit depth >= this (fraction)")
     ap.add_argument("--min-r2", type=float, default=0.5, help="detection: partial R^2 of the library term >= this")
     ap.add_argument("--min-rfl", type=float, default=0.05, help="detection: brightest fit-channel reflectance >= this")
